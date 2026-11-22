@@ -1,0 +1,241 @@
+from __future__ import annotations
+
+from datetime import date
+import re
+import logging
+
+from dataclasses import fields
+from pydantic import BaseModel, ConfigDict, create_model, field_validator
+from pydantic.dataclasses import dataclass
+from enum import Enum
+from typing import Optional, get_type_hints
+
+logger = logging.getLogger(__name__)
+
+
+class SelectedExtractedFields(BaseModel):
+    def to_dict(self) -> dict:
+        return self.model_dump()
+
+    def format(self) -> str:
+        return "".join(
+            f"{key}: {value}\n"
+            for key, value in self.to_dict().items()
+            if value is not None
+        )
+
+
+class TargetParticipantsEnum(Enum):
+    UNIV_ONLY = "대학생만 가능"
+    ALL = "대학생 및 일반인"
+    NONE = "대학생 참여 불가능"
+
+
+class ActivityKindEnum(Enum):
+    CONTEST = "공모전"
+    COMPETITION = "경진대회"
+    HACKATHON = "해커톤"
+    SUPPORTERS = "서포터즈"
+    VOLUNTEER = "봉사"
+    STARTUP = "창업"
+    EDUCATION = "교육/프로그램"
+    OVERSEAS_EXPERIENCE = "해외탐방"
+    NETWORKING = "행사/네트워킹"
+    ETC = "기타"
+    INVALID_ACTIVITY = "부적합"
+    # 여기부턴 들어갈지 말지 모름 확정안됨
+    INTERNSHIP = "인턴/직무체험"
+
+
+class CategoryEnum(Enum):
+    IDEA = "기획/아이디어"
+    MARKETING = "홍보/마케팅"
+    AI_DATA = "AI/데이터"
+    IT_DEVELOP = "IT/개발"
+    SCIENCE_ENGINEERING = "과학/공학"
+    DESIGN = "디자인"
+    PHOTO_CONTENTS = "사진/영상/콘텐츠"
+    LITERATURE = "문학/글쓰기"
+    RESEARCH = "학술/연구"
+    CULTURE_ARTS = "문화/예체능"
+    ETC = "기타"
+
+
+@dataclass
+class ExtractedFields:
+    title: Optional[str]
+    host_organization: Optional[str]
+    target_participants: Optional[TargetParticipantsEnum]
+    is_for_enrolled_only: Optional[bool]
+    application_start_at: Optional[date]
+    application_end_at: Optional[date]
+    total_prize_amount: Optional[int]
+    prize_info: Optional[str]
+    activity_kind: Optional[ActivityKindEnum]
+    category: Optional[list[CategoryEnum]]
+    is_team: Optional[bool]
+    is_team_evidence: Optional[str]  # 팀 참가 가능하다고 판단한 근거 문장
+    summary: Optional[str] = None
+
+    @classmethod
+    def select_fields(cls, keys: list[str]) -> type[SelectedExtractedFields]:
+        field_types = get_type_hints(cls)
+        if not keys or len(keys) != len(set(keys)):
+            raise ValueError("필드 이름을 중복 없이 하나 이상 지정해야 합니다")
+        unknown = set(keys) - field_types.keys()
+        if unknown:
+            raise ValueError(f"정의되지 않은 필드: {', '.join(sorted(unknown))}")
+
+        validators = {}
+        for key, name in (
+            ("target_participants", "_validate_target_participants"),
+            ("activity_kind", "_validate_activity_kind"),
+            ("category", "_validate_category"),
+        ):
+            if key in keys:
+                validators[name] = field_validator(key, mode="before")(
+                    getattr(cls, name).__func__
+                )
+
+        return create_model(
+            f"{cls.__name__}Subset",
+            __base__=SelectedExtractedFields,
+            __validators__=validators,
+            **{key: (field_types[key], ...) for key in keys},
+        )
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ExtractedFields:
+        # data 객체 내에 정의되지 않은 키가 있으면 무시
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+    def to_dict(self) -> dict:
+        return {field.name: getattr(self, field.name) for field in fields(self)}
+
+    @field_validator("target_participants", mode="before")
+    @classmethod
+    def _validate_target_participants(
+        cls, value: object
+    ) -> Optional[TargetParticipantsEnum]:
+        if value is None:
+            return None
+        try:
+            return TargetParticipantsEnum(value)
+        except (ValueError, TypeError):
+            logger.warning("LLM 응답 참가대상 값 오류: %r", value)
+            return None
+
+    @field_validator("activity_kind", mode="before")
+    @classmethod
+    def _validate_activity_kind(cls, value: object) -> Optional[ActivityKindEnum]:
+        if value is None:
+            return None
+        try:
+            return ActivityKindEnum(value)
+        except (ValueError, TypeError):
+            logger.warning("LLM 응답 활동종류 값 오류: %r", value)
+            return None
+
+    @field_validator("category", mode="before")
+    @classmethod
+    def _validate_category(cls, value: object) -> object:
+        if not isinstance(value, list):
+            return value
+
+        categories = []
+        for item in value:
+            try:
+                categories.append(CategoryEnum(item))
+            except (ValueError, TypeError):
+                logger.warning("LLM 응답 활동분야 값 오류: %r", item)
+        return categories
+
+    def format(self) -> str:
+        formatted = ""
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if value is not None:
+                formatted += f"{field.name}: {value}\n"
+        return formatted
+
+    def _normalize_prize(self, value: str) -> str:
+        unit_normalized = re.sub(r"\s*만\s*원", "0000원", value)
+
+        comma_removed = ""
+        for i in range(len(unit_normalized)):
+            if (
+                0 < i < len(unit_normalized)
+                and unit_normalized[i] == ","
+                and "0" <= unit_normalized[i - 1] <= "9"
+                and "0" <= unit_normalized[i + 1] <= "9"
+            ):
+                continue
+            else:
+                comma_removed += unit_normalized[i]
+
+        return comma_removed
+
+    def _normalize(self, value: str) -> str:
+        unnecessary_char_removed = re.sub(r"[^a-zA-Z0-9가-힣]", " ", value)
+        spaces_removed = re.sub(r"\s+", " ", unnecessary_char_removed)
+        return spaces_removed
+
+    def _compare_field(self, value, target_value, is_prize):
+        if isinstance(value, list) and isinstance(target_value, list):
+            # 카테고리 리스트에 대해서는 정답 리스트 안에 있는 것/추가/누락된 것을 각각 숫자로 바교
+            results = {"EXACT": 0, "ADDED": 0, "OMITTED": 0}
+
+            for v in value:
+                if v in target_value:
+                    # 키가 정답 리스트 안에 존재할 경우
+                    results["EXACT"] += 1
+                else:
+                    # 정답 리스트안에 없을 경우. 즉 모델이 추가한 경우
+                    results["ADDED"] += 1
+
+            # 정답 리스트에 있는데 모델 응답에서는 누락된 경우
+            diff = set(target_value) - set(value)
+            results["OMITTED"] += len(diff)
+
+            return results
+
+        if value == target_value:
+            # 정확히 일치할 경우 EXACT 판정
+            return "EXACT"
+
+        if isinstance(value, str) and isinstance(target_value, str):
+            if is_prize:
+                # 상금 텍스트 비교는 금액 정규화 후 진행
+                value = self._normalize_prize(value)
+                target_value = self._normalize_prize(target_value)
+
+                if value == target_value:
+                    return "PRIZE_NORMALIZED"
+
+            # 문자열 타입 정규화 후 일부 (더 짧은 쪽 기준 70% 이상) 겹칠 경우 CLOSE로 처리
+            words = set(self._normalize(value).split())
+            target_words = set(self._normalize(target_value).split())
+
+            if len(words & target_words) >= min(len(words), len(target_words)) * 0.7:
+                return "CLOSE"
+
+        return "MISS"
+
+    def compare(self, target: ExtractedFields) -> dict[str, object]:
+        # 정답 라벨(target)과 모델의 실제 응답을 필드 하나씩 비교
+        results = {}
+
+        for field in fields(self):
+            if field.name == "summary":
+                # 요약문 비교는 생략
+                continue
+
+            value = getattr(self, field.name)
+            target_value = getattr(target, field.name)
+
+            results[field.name] = self._compare_field(
+                value, target_value, (field.name == "prize")
+            )
+
+        return results
