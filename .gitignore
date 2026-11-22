@@ -1,0 +1,19 @@
+.venv/
+.vscode/
+.agents/
+.claude/
+
+*.pyc
+
+.env
+tmp/
+
+data/backup/
+data/images/test/**
+data/images/train/**
+!data/images/**/*.json
+
+*.csv
+
+# 임시 (배포관련)
+.github/workflows/
