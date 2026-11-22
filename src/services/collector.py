@@ -8,19 +8,25 @@ from urllib.parse import parse_qs, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from src.llm.dto import CategoryEnum
+from src.llm.dto import ActivityKindEnum, CategoryEnum, TargetParticipantsEnum
 from src.config import settings
-from src.services.constants import UrlType
-from src.services.extraction import (
-    InvalidContestError,
-    check_valid_activity_after_text,
-    check_valid_activity_after_image,
-    filter_official_url,
-)
+from src.constants import UrlType
 from src.llm.field_extractor import extract_fields_from_text, extract_fields_from_images
 from src.llm.prompts import FIELDS_DESCRIPTION
 from src.parsers.uos_rss_parser import parse_uos_rss
 from src.parsers.contest_korea_parser import parse_contest_korea
+
+from constants import (
+    CAMPUSPICK_HOSTNAME,
+    UOS_HOSTNAME,
+    UrlType,
+    SNS_DOMAINS,
+    APPLY_PATH_KEYWORDS,
+    IRRELEVANT_KEYWORDS,
+    OFFICIAL_PAGE_KEYWORDS,
+    DACON_HOSTNAME,
+    DAKER_HOSTNAME,
+)
 
 UOS_RSS_GENERAL = "https://www.uos.ac.kr/rss/gBoard.do"
 UOS_RSS_HAKSA = "https://www.uos.ac.kr/rss/hBoard.do"
@@ -51,6 +57,145 @@ CONTEST_KOREA_LISTS = {
 PAGE_EXTRACTION_CONCURRENCY = 5
 
 logger = logging.getLogger(__name__)
+
+
+class InvalidContestError(Exception):
+    """필드 추출 결과가 조건에 맞지 않을 시 발생하는 예외"""
+
+
+def check_valid_activity_after_text(extracted_fields: dict):
+    """참여할 수 없는 활동이거나 팀 참가가 불가능한 경우 필터링 함수"""
+    application_end_at = extracted_fields.get("application_end_at", None)
+    target_participants = extracted_fields.get("target_participants", None)
+    activity_kind = extracted_fields.get("activity_kind", None)
+    is_team = extracted_fields.get("is_team", None)
+
+    error_message = ""
+
+    if (
+        application_end_at is not None
+        and application_end_at < datetime.now(settings.TIMEZONE).date()
+    ):
+        error_message = "마감일이 지난 활동입니다."
+    elif target_participants == TargetParticipantsEnum.NONE:
+        error_message = "대학(원)생이 참가할 수 없는 활동입니다."
+    elif activity_kind == ActivityKindEnum.INVALID_ACTIVITY:
+        error_message = "공모전 및 대외활동에 해당하지 않습니다."
+    elif is_team == False:
+        error_message = "팀으로 참가할 수 없는 활동입니다."
+
+    if error_message:
+        logger.info(f"[필터링됨] {extracted_fields}")
+        raise InvalidContestError(error_message)
+
+
+def check_valid_activity_after_image(extracted_fields: dict):
+    check_valid_activity_after_text(extracted_fields)
+
+    application_end_at = extracted_fields.get("application_end_at", None)
+    is_team = extracted_fields.get("is_team", None)
+
+    error_message = ""
+
+    if not application_end_at:
+        error_message = "신청 마감일 정보를 찾을 수 없습니다."
+    elif not is_team:
+        error_message = "팀으로 참가할 수 없는 활동입니다."
+
+    if error_message:
+        logger.info(f"[필터링됨] {extracted_fields}")
+        raise InvalidContestError(error_message)
+
+
+def _normalize_hostname(url: str) -> str:
+    """도메인 비교를 위해 호스트를 소문자로 바꾸고 선행 www. 제거"""
+    return (urlparse(url).hostname or "").lower().removeprefix("www.").strip()
+
+
+def filter_official_url(blocks: list[dict], source_url: str) -> str | None:
+    """링크 목록 중 주최사 공식 홈페이지를 찾아 반환 (연관 공모전, 신청 폼, 주최사 SNS 등 제외)"""
+    candidate_urls = []
+    source_domain = _normalize_hostname(source_url)
+
+    for block in blocks:
+        url = block["url"]
+        domain = _normalize_hostname(url)
+        if re.search(domain, source_domain) or re.search(source_domain, domain):
+            # 같은 도메인(연관공모전, 공모전 사이트 자체 게시판 페이지 등) 제외
+            if domain == UOS_HOSTNAME or source_domain == UOS_HOSTNAME:
+                if domain == source_domain:
+                    continue  # UOS 공지는 도메인 완전 일치할 경우에만 제외
+            elif domain == CAMPUSPICK_HOSTNAME:
+                if url.find("linkclick") == -1:
+                    continue  # 캠퍼스픽 redirect 경로는 포함
+            else:
+                continue
+        if (source_domain == DACON_HOSTNAME and domain == DAKER_HOSTNAME) or (
+            source_domain == DAKER_HOSTNAME and domain == DACON_HOSTNAME
+        ):
+            continue  # 데이콘-데이커 (연관 플랫폼) 필터링
+
+        if any(re.search(sns, _normalize_hostname(url)) for sns in SNS_DOMAINS):
+            continue  # SNS 주소 제외
+        if any(re.search(keyword, url) for keyword in APPLY_PATH_KEYWORDS):
+            continue  # 신청폼 주소 제외
+
+        has_official_keyword = any(
+            re.search(keyword, block["text"]) for keyword in OFFICIAL_PAGE_KEYWORDS
+        )
+        has_official_inline_keyword = any(
+            re.search(keyword, block["line"]) for keyword in OFFICIAL_PAGE_KEYWORDS
+        )
+        has_official_context_keyword = any(
+            re.search(keyword, block["context"]) for keyword in OFFICIAL_PAGE_KEYWORDS
+        )
+
+        has_irrelevant_keyword = any(
+            re.search(keyword, block["text"]) for keyword in IRRELEVANT_KEYWORDS
+        )
+        has_irrelevant_inline_keyword = any(
+            re.search(keyword, block["line"]) for keyword in IRRELEVANT_KEYWORDS
+        )
+        has_irrelevant_context_keyword = any(
+            re.search(keyword, block["context"]) for keyword in IRRELEVANT_KEYWORDS
+        )
+
+        if (
+            has_irrelevant_keyword
+            or (not has_official_keyword and has_irrelevant_inline_keyword)
+            or (
+                not has_official_keyword
+                and not has_irrelevant_inline_keyword
+                and has_irrelevant_context_keyword
+            )
+        ):
+            # irrelevant 키워드가 있으면 추출하지 않음(a 태그 자체 텍스트 -> 해당 라인의 텍스트 -> 이전 문맥 순으로 비교)
+            continue
+
+        candidate_level = (
+            1
+            if has_official_keyword
+            else (
+                2
+                if has_official_inline_keyword
+                else (3 if has_official_context_keyword else 4)
+            )
+        )
+
+        candidate_urls.append({"url": url, "candidate_level": candidate_level})
+
+    for level in range(1, 5):
+        result = list(
+            {url["url"] for url in candidate_urls if url["candidate_level"] == level}
+        )
+        if result:
+            break
+
+    if len(result) == 0:
+        return None
+    elif len(result) > 1:
+        result = sorted(result, key=len)
+    return result[0]
 
 
 def _published_in_range(page: dict, start: datetime, end: datetime) -> bool:
@@ -280,9 +425,7 @@ async def collect_contest_korea(
         )
     )
     new_last_str_nos = {
-        name: max(
-            [last_str_nos[name], *(contest_korea_str_no(url) for url in urls)]
-        )
+        name: max([last_str_nos[name], *(contest_korea_str_no(url) for url in urls)])
         for name, urls in zip(names, url_lists)
     }
     detail_urls = list(dict.fromkeys(url for urls in url_lists for url in urls))

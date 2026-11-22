@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup, Tag
 
-from src.services.constants import UrlType
+from src.constants import UrlType
 from src.llm.dto import TargetParticipantsEnum, ActivityKindEnum, CategoryEnum
 
 CATEGORY_MAPPINGS = {
