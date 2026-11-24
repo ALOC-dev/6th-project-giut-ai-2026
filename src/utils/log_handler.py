@@ -1,110 +1,82 @@
-from datetime import date, datetime, tzinfo
-import glob
+"""GPT 사용량, 백엔드 요청, API 요청 기록을 S3에 저장
+
+S3 객체는 이어 쓰기가 불가능하므로 다음과 같이 저장한다.
+- gpt_usage: 메모리에 모아 두었다가 flush_logs() 호출 시 JSONL 객체 하나로 업로드
+  (Lambda 핸들러 끝에서 finally로 flush_logs()를 호출해야 함)
+- backend_requests: 실행당 호출 횟수가 적고 유실되면 안 되므로 호출할 때마다 바로 업로드
+
+키 형식: {LOG_S3_PREFIX}/{종류}/{YYYY-MM-DD}/{종류}_{YYYYMMDDTHHMMSS}_{uuid}.{jsonl|json}
+(날짜는 서울 기준. 오래된 로그 삭제는 버킷 수명 주기 규칙으로 관리)
+"""
+
+from datetime import datetime
 import json
 import logging
-from logging.handlers import BaseRotatingHandler
-import os
-from pathlib import Path
-import shutil
 from threading import Lock
 from typing import Any, Literal
+from uuid import uuid4
 
 from openai.types import CompletionUsage
 from pydantic import BaseModel
 import requests
 
-from src.config import BASE_DIR, settings
+from src.config import settings
+from src.storage.s3 import s3_client
 
 logger = logging.getLogger(__name__)
 
-_usage_logger = logging.getLogger(f"{__name__}.gpt_usage")
-_usage_logger_lock = Lock()
-_request_log_lock = Lock()
-BACKEND_REQUEST_LOG_PREFIX = "backend_requests_"
-BACKEND_REQUEST_LOG_BACKUP_COUNT = 30
-_api_logger = logging.getLogger(f"{__name__}.api_requests")
-_api_logger_lock = Lock()
+GPT_USAGE_LOG = "gpt_usage"
+BACKEND_REQUEST_LOG = "backend_requests"
+
+_buffer_lock = Lock()
+_buffers: dict[str, list[str]] = {GPT_USAGE_LOG: []}
 
 
-class DailyRotatingFileHandler(BaseRotatingHandler):
-    """지정한 타임존의 날짜가 바뀌면 기존 파일을 `<파일명>.YYYY-MM-DD`로 넘기는 핸들러
+def _log_key(kind: str, at: datetime, extension: str) -> str:
+    at = at.astimezone(settings.TIMEZONE)
+    return (
+        f"{settings.LOG_S3_PREFIX}/{kind}/{at.date().isoformat()}/"
+        f"{kind}_{at:%Y%m%dT%H%M%S}_{uuid4().hex[:8]}.{extension}"
+    )
 
-    TimedRotatingFileHandler는 UTC/서버 로컬 시간만 지원하므로 타임존을 직접 받도록 구현함
+
+def _put_log(key: str, body: str, content_type: str) -> None:
+    s3_client.put_object(
+        Bucket=settings.LOG_S3_BUCKET,
+        Key=key,
+        Body=body.encode("utf-8"),
+        ContentType=f"{content_type}; charset=utf-8",
+    )
+
+
+def _buffer_line(kind: str, line: str) -> None:
+    with _buffer_lock:
+        _buffers[kind].append(line)
+
+
+def flush_logs() -> None:
+    """메모리에 모아 둔 로그를 종류별 JSONL 객체로 업로드
+
+    업로드에 실패한 종류는 버퍼에 다시 넣어 다음 flush에서 재시도
+    (Lambda warm start 시 같은 실행 환경에서 재사용됨)
     """
+    with _buffer_lock:
+        pending = {kind: lines for kind, lines in _buffers.items() if lines}
+        for kind in pending:
+            _buffers[kind] = []
 
-    def __init__(
-        self,
-        filename: str | os.PathLike[str],
-        tz: tzinfo,
-        backup_count: int = 30,
-        encoding: str = "utf-8",
-    ) -> None:
-        super().__init__(filename, "a", encoding=encoding)
-        self.tz = tz
-        self.backup_count = backup_count
-        # 기존 파일이 있으면 마지막 수정 날짜를 현재 파일의 날짜로 간주
-        if os.path.exists(self.baseFilename):
-            mtime = os.stat(self.baseFilename).st_mtime
-            self._current_date = datetime.fromtimestamp(mtime, tz).date()
-        else:
-            self._current_date = datetime.now(tz).date()
-        self._next_date: date = self._current_date
-
-    def shouldRollover(self, record: logging.LogRecord) -> bool:
-        self._next_date = datetime.fromtimestamp(record.created, self.tz).date()
-        return self._next_date != self._current_date
-
-    def doRollover(self) -> None:
-        if self.stream:
-            self.stream.close()
-            self.stream = None
-
-        if os.path.exists(self.baseFilename):
-            dfn = self.rotation_filename(
-                f"{self.baseFilename}.{self._current_date.isoformat()}"
+    now = datetime.now(settings.TIMEZONE)
+    for kind, lines in pending.items():
+        try:
+            _put_log(
+                _log_key(kind, now, "jsonl"),
+                "\n".join(lines) + "\n",
+                "application/x-ndjson",
             )
-            if os.path.exists(dfn):
-                # 같은 날짜 파일이 이미 있으면 덮어쓰지 않고 이어 붙임
-                with open(self.baseFilename, "rb") as src, open(dfn, "ab") as dst:
-                    shutil.copyfileobj(src, dst)
-                os.remove(self.baseFilename)
-            else:
-                self.rotate(self.baseFilename, dfn)
-
-        if self.backup_count > 0:
-            backups = sorted(
-                glob.glob(f"{glob.escape(self.baseFilename)}.[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]")
-            )
-            for old in backups[: -self.backup_count]:
-                os.remove(old)
-
-        self._current_date = self._next_date
-        self.stream = self._open()
-
-
-def _ensure_file_handler(
-    target: logging.Logger, lock: Lock, log_dir: str, filename: str
-) -> None:
-    """최초 호출 시 한 번만 날짜별 파일 핸들러를 붙임
-
-    핸들러 생성을 직렬화하여 스레드에서 호출해도 중복 등록 방지됨
-    """
-    with lock:
-        if target.handlers:
-            return
-        path = Path(log_dir).expanduser()
-        if not path.is_absolute():
-            path = BASE_DIR / path
-        path.mkdir(parents=True, exist_ok=True)
-        handler = DailyRotatingFileHandler(
-            path / filename,
-            tz=settings.TIMEZONE,
-            backup_count=30,
-        )
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        target.setLevel(logging.INFO)
-        target.propagate = False
-        target.addHandler(handler)
+        except Exception:
+            logger.exception("%s 로그 업로드 실패 (%d건)", kind, len(lines))
+            with _buffer_lock:
+                _buffers[kind][:0] = lines
 
 
 def write_gpt_usage_log(
@@ -120,10 +92,10 @@ def write_gpt_usage_log(
     status: Literal["success", "error"] = "success",
     error_type: str | None = None,
 ) -> None:
-    """시작·종료 시각으로 elapsed_ms를 계산하고 GPT 호출 한 건을 JSONL로 기록
+    """시작·종료 시각으로 elapsed_ms를 계산하고 GPT 호출 한 건을 버퍼에 기록
 
-    잘못된 인자는 ValueError로 알리지만, 파일 기록 실패는 GPT 호출 결과에 영향을 주지 않도록
-    로그만 남기고 삼킴
+    잘못된 인자는 ValueError로 알리지만, 기록 실패는 GPT 호출 결과에 영향을 주지 않도록
+    로그만 남기고 삼킴. 실제 업로드는 flush_logs()에서 수행
     """
     if started_at.utcoffset() is None or ended_at.utcoffset() is None:
         raise ValueError("started_at, ended_at에 시간대가 필요합니다.")
@@ -161,14 +133,9 @@ def write_gpt_usage_log(
         ),
     }
     try:
-        message = json.dumps(record, ensure_ascii=False, allow_nan=False)
-        _ensure_file_handler(
-            _usage_logger,
-            _usage_logger_lock,
-            settings.GPT_USAGE_LOG_DIR,
-            "gpt_usage.jsonl",
+        _buffer_line(
+            GPT_USAGE_LOG, json.dumps(record, ensure_ascii=False, allow_nan=False)
         )
-        _usage_logger.info(message)
     except Exception:
         # 기록 실패가 GPT 추출 결과에 영향을 주지 않도록 로그만 남김
         logger.exception("GPT 사용량 기록 실패")
@@ -186,35 +153,6 @@ def _response_body_for_log(response: requests.Response | None) -> Any:
     return response.text
 
 
-def _read_record_list(path: Path) -> list:
-    """기존 날짜 파일의 리스트를 읽음. 형식이 깨졌으면 옆으로 옮겨 두고 새로 시작"""
-    try:
-        records = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return []
-    except ValueError:
-        records = None
-    if isinstance(records, list):
-        return records
-
-    broken = path.with_name(
-        f"{path.name}.broken-{datetime.now(settings.TIMEZONE):%H%M%S}"
-    )
-    path.replace(broken)
-    logger.error("백엔드 요청 로그 형식 오류로 파일을 옮김: %s", broken)
-    return []
-
-
-def _remove_old_request_logs(log_dir: Path) -> None:
-    files = sorted(
-        log_dir.glob(
-            f"{BACKEND_REQUEST_LOG_PREFIX}[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].json"
-        )
-    )
-    for old in files[:-BACKEND_REQUEST_LOG_BACKUP_COUNT]:
-        old.unlink()
-
-
 def write_backend_request_log(
     payload: list[dict],
     *,
@@ -223,11 +161,7 @@ def write_backend_request_log(
     response: requests.Response | None,
     error: Exception | None,
 ) -> None:
-    """백엔드로 보낸 요청 본문과 응답 결과를 날짜별 JSON 리스트 파일에 추가
-
-    `backend_requests_YYYY-MM-DD.json`(서울 기준 sent_at 날짜) 하나가 `[{...}, {...}]` 형태의
-    올바른 JSON 문서가 되도록 기존 리스트를 읽어 추가한 뒤 통째로 다시 씀
-    """
+    """백엔드로 보낸 요청 본문과 응답 결과를 요청 한 건당 JSON 객체 하나로 바로 업로드"""
     try:
         sent_at = sent_at.astimezone(settings.TIMEZONE)
         record = {
@@ -239,83 +173,11 @@ def write_backend_request_log(
             "error": repr(error) if error is not None else None,
             "payload": payload,
         }
-        # 직렬화가 실패하면 기존 파일을 건드리지 않도록 먼저 검증
-        json.dumps(record, ensure_ascii=False)
-
-        log_dir = Path(settings.BACKEND_REQUEST_LOG_DIR).expanduser()
-        if not log_dir.is_absolute():
-            log_dir = BASE_DIR / log_dir
-        path = log_dir / f"{BACKEND_REQUEST_LOG_PREFIX}{sent_at.date().isoformat()}.json"
-
-        with _request_log_lock:
-            log_dir.mkdir(parents=True, exist_ok=True)
-            records = _read_record_list(path)
-            records.append(record)
-            tmp_path = path.with_name(path.name + ".tmp")
-            tmp_path.write_text(
-                json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            tmp_path.replace(path)  # 쓰는 도중 중단돼도 기존 파일이 깨지지 않도록 교체
-            _remove_old_request_logs(log_dir)
+        _put_log(
+            _log_key(BACKEND_REQUEST_LOG, sent_at, "json"),
+            json.dumps(record, ensure_ascii=False, indent=2),
+            "application/json",
+        )
     except Exception:
         # 기록 실패가 전송 결과에 영향을 주지 않도록 로그만 남김
         logger.exception("백엔드 요청 기록 실패")
-
-
-def _body_for_log(body: Any) -> Any:
-    """요청·응답 본문을 JSON으로 기록할 수 있는 형태로 변환
-
-    pydantic 모델은 dict로, bytes는 JSON이면 파싱하고 아니면 문자열로 변환
-    """
-    if isinstance(body, BaseModel):
-        return body.model_dump(mode="json")
-    if isinstance(body, (bytes, bytearray)):
-        text = body.decode("utf-8", errors="replace")
-        try:
-            return json.loads(text)
-        except ValueError:
-            return text
-    return body
-
-
-def write_api_request_log(
-    *,
-    method: str,
-    path: str,
-    request_body: Any,
-    received_at: datetime,
-    responded_at: datetime,
-    status_code: int | None,
-    response_body: Any,
-    error: Exception | None = None,
-) -> None:
-    """API로 받은 요청과 응답 결과를 JSONL 한 줄로 기록"""
-    try:
-        received_at = received_at.astimezone(settings.TIMEZONE)
-        responded_at = responded_at.astimezone(settings.TIMEZONE)
-        record = {
-            "received_at": received_at.isoformat(timespec="milliseconds"),
-            "responded_at": responded_at.isoformat(timespec="milliseconds"),
-            "elapsed_ms": round(
-                (responded_at - received_at).total_seconds() * 1000, 3
-            ),
-            "method": method,
-            "path": path,
-            "status_code": status_code,
-            "unhandled_exception": repr(error) if error is not None else None,
-            "request_body": _body_for_log(request_body),
-            "response_body": _body_for_log(response_body),
-        }
-        # 응답에 date·Enum 등이 섞여 있어도 기록이 실패하지 않도록 문자열로 변환
-        message = json.dumps(record, ensure_ascii=False, default=str)
-
-        _ensure_file_handler(
-            _api_logger,
-            _api_logger_lock,
-            settings.API_REQUEST_LOG_DIR,
-            "api_requests.jsonl",
-        )
-        _api_logger.info(message)
-    except Exception:
-        # 기록 실패가 API 응답에 영향을 주지 않도록 로그만 남김
-        logger.exception("API 요청 기록 실패")

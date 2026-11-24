@@ -5,14 +5,14 @@ from typing import Any, Mapping
 import requests
 from pydantic import TypeAdapter
 
-from src.api.dto import CompetitionExtractResponse
+from src.api.dto import CompetitionBatchRequest
 from src.config import settings
 from src.utils.log_handler import write_backend_request_log
 
 COMPETITIONS_API_URL = settings.COMPETITIONS_API_URL
 logger = logging.getLogger(__name__)
 
-_competition_list_adapter = TypeAdapter(list[CompetitionExtractResponse])
+_competition_list_adapter = TypeAdapter(list[CompetitionBatchRequest])
 
 
 def post_competition(

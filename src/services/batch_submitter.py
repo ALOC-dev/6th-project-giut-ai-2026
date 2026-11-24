@@ -7,7 +7,7 @@ collector.py의 extract_fields_from_text 호출 직전 단계까지를 담당한
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 import json
 import logging
@@ -36,11 +36,14 @@ from src.llm.prompts import FIELDS_DESCRIPTION, CONTEST_TEXT_PROMPT, UOS_TEXT_PR
 from src.parsers.contest_korea_parser import parse_contest_korea
 from src.parsers.uos_rss_parser import parse_uos_rss
 from src.storage.batch_context import batch_context_key, save_batch_context
+from src.storage.collector_state import load_contest_korea_state
 
 logger = logging.getLogger(__name__)
 
 BATCH_ENDPOINT = "/v1/chat/completions"
 BATCH_COMPLETION_WINDOW = "24h"
+
+COLLECT_INTERVAL = timedelta(hours=12)  # EventBridge가 서울 기준 00시, 12시에 호출
 
 UOS_RSS_GENERAL = "https://www.uos.ac.kr/rss/gBoard.do"
 UOS_RSS_HAKSA = "https://www.uos.ac.kr/rss/hBoard.do"
@@ -403,15 +406,12 @@ def _contest_korea_request(index: int, page: dict) -> tuple[str, dict, dict | No
     return custom_id, context, line
 
 
-async def submit_extraction_batch(
-    start: datetime,
-    end: datetime,
-    last_str_nos: dict[str, int],
-) -> dict:
+async def submit_extraction_batch(run_at: datetime) -> dict:
     """시립대 공지 및 콘테스트코리아를 파싱해 텍스트 필드 추출 요청을 배치로 제출
 
-    - 시립대: [start, end) 사이에 게시된 공지
-    - 콘테스트코리아: 목록별로 last_str_nos보다 큰 게시물
+    run_at: 이번 수집 예정 시각 (EventBridge Scheduler의 scheduled-time, 시간대 포함)
+    - 시립대: [run_at - COLLECT_INTERVAL, run_at) 사이에 게시된 공지
+    - 콘테스트코리아: 목록별로 S3에 저장된 마지막 str_no보다 큰 게시물
 
     S3 컨텍스트 문서({prefix}/{end(KST) YYYYMMDDTHHMM}.json) 구성:
         window_start, window_end: 수집 구간
@@ -423,6 +423,14 @@ async def submit_extraction_batch(
 
     반환값: batch_id, input_file_id, context_s3_key, last_str_nos
     """
+    if run_at.utcoffset() is None:
+        raise ValueError("run_at에 시간대가 필요합니다.")
+    end = run_at
+    start = end - COLLECT_INTERVAL
+    last_str_nos = await asyncio.to_thread(
+        load_contest_korea_state, list(CONTEST_KOREA_LISTS), start
+    )
+
     uos_pages, (contest_korea_pages, new_last_str_nos) = await asyncio.gather(
         _parse_uos_pages(start, end), _parse_contest_korea_pages(last_str_nos)
     )

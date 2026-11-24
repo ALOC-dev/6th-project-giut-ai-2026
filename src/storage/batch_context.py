@@ -4,11 +4,8 @@ from datetime import date, datetime
 from enum import Enum
 import json
 
-import boto3
-
 from src.config import settings
-
-_s3 = boto3.client("s3", region_name=settings.AWS_REGION)
+from src.storage.s3 import s3_client as _s3
 
 
 def _json_default(value: object) -> object:
