@@ -30,6 +30,11 @@ class Settings:
         "COLLECTOR_STATE_PATH", str(BASE_DIR / "tmp" / "collector_state.json")
     )
 
+    AWS_REGION = os.getenv("AWS_REGION")
+    # 배치 결과 처리에 필요한 중간 컨텍스트 저장 버킷
+    BATCH_CONTEXT_S3_BUCKET = os.getenv("BATCH_CONTEXT_S3_BUCKET")
+    BATCH_CONTEXT_S3_PREFIX = os.getenv("BATCH_CONTEXT_S3_PREFIX", "batch_contexts")
+
     X_AI_API_KEY = os.getenv("X_AI_API_KEY")
     COMPETITIONS_API_URL = os.getenv("COMPETITIONS_API_URL")
 
