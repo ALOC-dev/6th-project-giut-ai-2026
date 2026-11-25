@@ -152,24 +152,16 @@ def _target_participants(target_text: str) -> TargetParticipantsEnum:
         return TargetParticipantsEnum.NONE
 
 
-def _activity_kind(title: str, collect_source: str) -> ActivityKindEnum:
-    if collect_source == "contest":
-        if title.find("대회") != -1:
-            return ActivityKindEnum.COMPETITION
-        else:
-            return ActivityKindEnum.CONTEST
-
-    elif collect_source == "activity":
-        for activity_kind in ActivityKindEnum:
-            if title.find(activity_kind.value) != -1:
-                return activity_kind
-        return None
+def _activity_kind(title: str) -> ActivityKindEnum:
+    for activity_kind in ActivityKindEnum:
+        if title.find(activity_kind.value) != -1:
+            return activity_kind
+    return None
 
 
 def _category(category: str, collect_source: str) -> list[CategoryEnum] | None:
     if collect_source == "contest":
         return CATEGORY_MAPPINGS[category]
-
     elif collect_source == "activity":
         return None
 
@@ -232,7 +224,7 @@ def parse_contest_korea_html(
         "is_for_enrolled_only": (
             target_participants == TargetParticipantsEnum.UNIV_ONLY
         ),
-        "activity_kind": _activity_kind(title, collect_source),
+        "activity_kind": _activity_kind(title),
         "category": _category(category, collect_source),
         "application_start_at": application_start_at,
         "application_end_at": application_end_at,
