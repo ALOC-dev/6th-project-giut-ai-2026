@@ -43,8 +43,7 @@ class ActivityKindEnum(Enum):
     NETWORKING = "행사/네트워킹"
     ETC = "기타"
     INVALID_ACTIVITY = "부적합"
-    # 여기부턴 들어갈지 말지 모름 확정안됨
-    INTERNSHIP = "인턴/직무체험"
+    # INTERNSHIP = "인턴/직무체험" #확정아님
 
 
 class CategoryEnum(Enum):
