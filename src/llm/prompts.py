@@ -1,5 +1,7 @@
 from datetime import date
 
+from src.llm.dto import ActivityKindEnum, CategoryEnum
+
 FIELDS_DESCRIPTION = {
     "title": "- title (string): 공모전명(활동명) (실제 활동의 정식 명칭을 횟수, 수식어 등 생략 없이 명사형으로 작성)",
     "host_organization": "- host_organization (string): 주최기관 (후원기관은 미포함)",
@@ -9,8 +11,8 @@ FIELDS_DESCRIPTION = {
     "application_end_at": "- application_end_at (string, YYYY-MM-DD 형식): 접수 마감일",
     "prize_info": "- prize_info (string): '[1등상 명칭]([부문]): [훈격] [0,000만원] / [2등상 명칭]([부문]): [훈격] [0,000만원] / [3등상 명칭]([부문]): [훈격] [0,000만원]' 형식. '([부문])'은 부문에 따른 상금 구분이 있는 경우에만 표기. 명시되지 않은 등수 및 특별상 등은 생략. 훈격(ex. 'oo장관상' 등)과 상금 액수 중 누락된 항목만 생략. 등수별로 시상하는 형태가 아니라면 null",
     "total_prize_amount": "- total_prize_amount (int): 총 상금 금액(원 단위). 상금 규모를 알 수 없거나 등수별로 시상하는 형태가 아니라면 null",
-    "activity_kind": "- activity_kind (string): 활동 종류 또는 성격('공모전', '경진대회', '해커톤', '서포터즈', '봉사', '창업', '교육/프로그램', '해외탐방', '행사/네트워킹', '기타', '부적합' 중 택1). 공모전, 대회, 프로그램 등의 대외활동이 아닌 경우, 여러 행사에 대한 정보 나열인 경우 '부적합'을 선택할 것",
-    "category": "- category (list[string]): 활동 분야 ('기획/아이디어', '홍보/마케팅', 'AI/데이터', 'IT/개발', '과학/공학', '디자인', '사진/영상/콘텐츠', '문학/글쓰기', '학술/연구', '문화/예체능', '기타' 중 택1), 한 가지 분야만으로 특정할 수 없는 불가피한 경우에만 추가 선택할 수 있으며 최대 3개까지 허용",
+    "activity_kind": f"- activity_kind (string): 활동 종류 또는 성격({", ".join([f"'{e.value}'" for e in ActivityKindEnum])} 중 택1). 공모전, 대회, 프로그램 등의 대외활동이 아닌 경우, 여러 행사에 대한 정보 나열인 경우 '부적합'을 선택할 것",
+    "category": f"- category (list[string]): 활동 분야 ({", ".join([f"'{e.value}'" for e in CategoryEnum])} 중 택1), 한 가지 분야만으로 특정할 수 없는 불가피한 경우에만 추가 선택할 수 있으며 최대 3개까지 허용",
     "is_team": "- is_team (boolean): 팀으로 신청 가능 여부 (팀 가능 여부가 명시되지 않은 경우 '개인 참가만 가능'이라는 확실한 근거가 없으면 null)",
     "is_team_evidence": "- is_team_evidence (string): 팀 참가 가능 여부 또는 개인 참가만 가능 여부가 명시된 근거 문장 1개. 둘 중 하나라도 알 수 없는 경우 null",
     "summary": "- summary (string): 앞서 추출한 항목을 제외하고 활동 주제를 1문장으로 간결하게 요약. 문장 부호 없이 명사형 종결 사용",
@@ -57,3 +59,8 @@ UOS_IMAGE_PROMPT = f"""
 
 반드시 아래 키를 모두 포함한 JSON 객체 하나만 출력하고, JSON 앞뒤에 다른 텍스트를 붙이지 마라.
 """
+
+
+if __name__ == "__main__":
+    print(FIELDS_DESCRIPTION["activity_kind"])
+    print(FIELDS_DESCRIPTION["category"])

@@ -1,96 +1,76 @@
 import asyncio
 import logging
 from datetime import datetime
-from email.utils import parsedate_to_datetime
-import re
-from urllib.parse import parse_qs, urljoin, urlparse
 
-import requests
-from bs4 import BeautifulSoup
-
-from src.llm.dto import CategoryEnum
+from src.llm.dto import ActivityKindEnum, CategoryEnum, TargetParticipantsEnum
 from src.config import settings
-from src.services.constants import UrlType
-from src.services.extraction import (
-    InvalidContestError,
-    check_valid_activity_after_text,
-    check_valid_activity_after_image,
-    filter_official_url,
-)
+from src.constants import UrlType
 from src.llm.field_extractor import extract_fields_from_text, extract_fields_from_images
 from src.llm.prompts import FIELDS_DESCRIPTION
 from src.parsers.uos_rss_parser import parse_uos_rss
 from src.parsers.contest_korea_parser import parse_contest_korea
-
-UOS_RSS_GENERAL = "https://www.uos.ac.kr/rss/gBoard.do"
-UOS_RSS_HAKSA = "https://www.uos.ac.kr/rss/hBoard.do"
-
-CONTEST_KOREA_CONTEST_LIST = (
-    "https://www.contestkorea.com/sub/list.php?int_gbn=1"  # 공모전/대회
+from src.services.batch_submitter import (
+    CONTEST_KOREA_LISTS,
+    UOS_RSS_GENERAL,
+    UOS_RSS_HAKSA,
+    _contest_korea_detail_urls,
+    _published_in_range,
+    _uos_link_context_blocks,
+    contest_korea_str_no,
+    filter_official_url,
 )
-CONTEST_KOREA_ACTIVITY_LIST = (
-    "https://www.contestkorea.com/sub/list.php?int_gbn=2"  # 대외활동
-)
-CONTEST_KOREA_SCAN_LIMIT = 30  # 각 목록 앞 30개에서 새 게시물만 선택
-CONTEST_KOREA_FILTERS = {  # 공모전 검색 조건
-    "Txt_sortkey": "a.int_sort",
-    "Txt_sortword": "desc",
-    "Txt_code1[0]": "26",  # 누구나
-    "Txt_code1[1]": "30",  # 대학생
-    "Txt_code1[2]": "76",  # 대학원생
-    "Txt_area[0]": "75",  # 전국
-    "Txt_area[1]": "97",  # 온라인
-    "Txt_area[2]": "31",  # 서울
-}
-
-CONTEST_KOREA_LISTS = {
-    "contest": CONTEST_KOREA_CONTEST_LIST,
-    "activity": CONTEST_KOREA_ACTIVITY_LIST,
-}
 
 PAGE_EXTRACTION_CONCURRENCY = 5
 
 logger = logging.getLogger(__name__)
 
 
-def _published_in_range(page: dict, start: datetime, end: datetime) -> bool:
-    """게시 시각이 [start, end) 범위에 속하는지 확인"""
-    published_date = page.get("published_date", "")
-    try:
-        try:
-            published_at = parsedate_to_datetime(published_date)
-        except ValueError:
-            published_at = datetime.fromisoformat(published_date)
-    except (TypeError, ValueError):
-        logger.warning("시립대 RSS 게시일을 읽을 수 없음: %r", published_date)
-        return False
-
-    if published_at.tzinfo is None:
-        published_at = published_at.replace(tzinfo=settings.TIMEZONE)
-    return start <= published_at < end
+class InvalidContestError(Exception):
+    """필드 추출 결과가 조건에 맞지 않을 시 발생하는 예외"""
 
 
-def _uos_link_context_blocks(full_text: str) -> list[dict]:
-    blocks = []
-    for line in full_text.split("\n"):
-        urls_iter = {
-            *re.finditer(
-                r"(https?:\/\/)(?:[\w-]+\.)+[\w-]+(?::\d+)?(?:[\/?#][^\s]*)?", line
-            ),
-        }
-        next_idx = 0
-        for i in sorted(urls_iter, key=lambda i: i.start()):
-            start, end = i.span()
-            blocks.append(
-                {
-                    "url": line[start:end].strip(),
-                    "text": line[next_idx:start].strip(),
-                    "line": line,
-                    "context": "",
-                }
-            )
-            next_idx = end
-    return blocks
+def check_valid_activity_after_text(extracted_fields: dict):
+    """참여할 수 없는 활동이거나 팀 참가가 불가능한 경우 필터링 함수"""
+    application_end_at = extracted_fields.get("application_end_at", None)
+    target_participants = extracted_fields.get("target_participants", None)
+    activity_kind = extracted_fields.get("activity_kind", None)
+    is_team = extracted_fields.get("is_team", None)
+
+    error_message = ""
+
+    if (
+        application_end_at is not None
+        and application_end_at < datetime.now(settings.TIMEZONE).date()
+    ):
+        error_message = "마감일이 지난 활동입니다."
+    elif target_participants == TargetParticipantsEnum.NONE:
+        error_message = "대학(원)생이 참가할 수 없는 활동입니다."
+    elif activity_kind == ActivityKindEnum.INVALID_ACTIVITY:
+        error_message = "공모전 및 대외활동에 해당하지 않습니다."
+    elif is_team == False:
+        error_message = "팀으로 참가할 수 없는 활동입니다."
+
+    if error_message:
+        logger.info(f"[필터링됨] {extracted_fields}")
+        raise InvalidContestError(error_message)
+
+
+def check_valid_activity_after_image(extracted_fields: dict):
+    check_valid_activity_after_text(extracted_fields)
+
+    application_end_at = extracted_fields.get("application_end_at", None)
+    is_team = extracted_fields.get("is_team", None)
+
+    error_message = ""
+
+    if not application_end_at:
+        error_message = "신청 마감일 정보를 찾을 수 없습니다."
+    elif not is_team:
+        error_message = "팀으로 참가할 수 없는 활동입니다."
+
+    if error_message:
+        logger.info(f"[필터링됨] {extracted_fields}")
+        raise InvalidContestError(error_message)
 
 
 async def extract_uos_page(page: dict) -> dict:
@@ -167,69 +147,6 @@ async def collect_uos(start: datetime, end: datetime) -> list[dict]:
     return [result for result in results if result is not None]
 
 
-def contest_korea_str_no(url: str) -> int | None:
-    """상세 URL의 str_no(YYYYMMDD + 일련번호)를 정수로 반환"""
-    str_no = parse_qs(urlparse(url).query).get("str_no", [""])[0]
-    return int(str_no) if str_no.isdigit() else None
-
-
-async def _contest_korea_detail_urls(list_url: str, last_str_no: int) -> list[str]:
-    """목록에서 str_no가 last_str_no보다 큰 게시물의 상세 URL 반환"""
-    page_url = list_url.split("?", maxsplit=1)[0]
-    int_gbn = parse_qs(urlparse(list_url).query)["int_gbn"][0]
-    first_page = True
-    detail_urls = []
-    seen_urls = set()
-    scanned_entries = 0
-
-    while page_url and scanned_entries < CONTEST_KOREA_SCAN_LIMIT:
-        response = await asyncio.to_thread(
-            requests.get,
-            page_url,
-            params=(
-                {"int_gbn": int_gbn, **CONTEST_KOREA_FILTERS} if first_page else None
-            ),
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=30,
-        )
-        response.raise_for_status()
-        first_page = False
-        soup = BeautifulSoup(response.content, "html.parser")
-        entries = soup.select(".list_style_2 .title a[href*='str_no=']")
-        if not entries:
-            break
-
-        # 사이트의 목록 순서는 게시일 순서가 아니므로 오래된 글이 나와도 CONTEST_KOREA_SCAN_LIMIT 범위 내에서 계속 확인
-        candidates = entries[: CONTEST_KOREA_SCAN_LIMIT - scanned_entries]
-        scanned_entries += len(candidates)
-        for entry in candidates:
-            url = urljoin(response.url, entry["href"])
-            str_no = contest_korea_str_no(url)
-            if str_no is None:
-                logger.warning("콘테스트코리아 게시물 번호를 읽을 수 없음: %s", url)
-                continue
-
-            if str_no > last_str_no and url not in seen_urls:
-                seen_urls.add(url)
-                detail_urls.append(url)
-
-        if scanned_entries >= CONTEST_KOREA_SCAN_LIMIT:
-            break
-
-        current_page = int(parse_qs(urlparse(response.url).query).get("page", ["1"])[0])
-        next_page = None
-        for link in soup.select(".pagination a[href]"):
-            candidate = urljoin(response.url, link["href"])
-            if parse_qs(urlparse(candidate).query).get("page") == [
-                str(current_page + 1)
-            ]:
-                next_page = candidate
-                break
-        page_url = next_page
-
-    return detail_urls
-
-
 async def extract_contest_korea_page(page: dict) -> dict:
     extracted_fields = {key: page.get(key, None) for key in FIELDS_DESCRIPTION.keys()}
     extracted_fields["urls"] = page["urls"]
@@ -280,9 +197,7 @@ async def collect_contest_korea(
         )
     )
     new_last_str_nos = {
-        name: max(
-            [last_str_nos[name], *(contest_korea_str_no(url) for url in urls)]
-        )
+        name: max([last_str_nos[name], *(contest_korea_str_no(url) for url in urls)])
         for name, urls in zip(names, url_lists)
     }
     detail_urls = list(dict.fromkeys(url for urls in url_lists for url in urls))

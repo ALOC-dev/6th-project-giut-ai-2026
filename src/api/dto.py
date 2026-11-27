@@ -17,16 +17,12 @@ class CamelModel(BaseModel):
     )
 
 
-class CompetitionExtractRequest(BaseModel):
-    url: str
-
-
 class UrlItem(CamelModel):
     type: str
     url: str | None
 
 
-class CompetitionExtractResponse(CamelModel):
+class CompetitionBatchRequest(CamelModel):
     title: Optional[str] = None
     host_organization: Optional[str] = None
     target_participants: Optional[Annotated[TargetParticipantsEnum, EnumName]] = None
